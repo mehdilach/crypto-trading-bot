@@ -19,10 +19,38 @@ crypto-trading-bot/
 ├── strategies/
 │   ├── base.py                 # interface commune à toute stratégie
 │   └── moving_average_crossover.py  # stratégie exemple
+├── backtesting/
+│   ├── fetch_historical_data.py # téléchargement OHLCV Binance (API publique)
+│   ├── backtest_engine.py      # backtest réutilisant Strategy + RiskManager
+│   └── data/                    # CSV téléchargés (ignorés par git)
 ├── logs/                       # logs runtime (ignorés par git)
 ├── .env.example                # template de config
 └── requirements.txt
 ```
+
+## Backtesting
+
+Le module `backtesting/` valide une stratégie sur données historiques **sans
+rien modifier du bot live** : il réutilise la même interface `Strategy` et le
+même `RiskManager` que `main.py` (frais 0,1 %/ordre + slippage 0,05 % par
+défaut, stop-loss intra-bougie).
+
+```bash
+# 1. Télécharger l'historique (API publique Binance, aucune clé requise)
+python backtesting/fetch_historical_data.py --days 180 --timeframe 5m
+
+# 2. Backtester une config (capital fictif, taille d'ordre, frais, slippage)
+python backtesting/backtest_engine.py --data backtesting\data\btc_usdt_5m.csv \
+    --capital 1000 --entry-size 50 --fast 3 --slow 7
+```
+
+Options utiles : `--stop-loss-pct` (défaut : celui du `.env`),
+`--window` (défaut 100 ; doit dépasser la MA lente, ex: 210 pour MA(200)),
+`--fee`, `--slippage`.
+
+Résultats 6 mois (2026-02-12 → 2026-08-11, marché baissier -5,6 %) :
+aucune config testée (MA 3/7, 9/21, 20/50, 50/200) n'a été rentable ;
+la moins mauvaise est MA(50)/MA(200) (-2,3 % vs buy-and-hold -5,6 %).
 
 ## Installation
 
