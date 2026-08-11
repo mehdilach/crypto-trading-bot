@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from risk_manager import RiskManager
+from regime_filter import detect_regime
 from strategies.base import Signal
 from strategies.moving_average_crossover import MovingAverageCrossover
 from strategies.rsi_mean_reversion import RsiMeanReversion
@@ -44,6 +45,8 @@ class BacktestEngine:
         window_size=100,
         risk_mode="fixed",
         trailing_pct=2.0,
+        regime_filter=False,
+        strategy_type="ma",
     ):
         self.strategy = strategy
         self.capital = initial_capital
@@ -61,6 +64,12 @@ class BacktestEngine:
             )
         else:
             self.risk = RiskManager(max_order_size=max_order_size, stop_loss_pct=stop_loss_pct)
+        self.regime_filter = regime_filter
+        self.strategy_type = strategy_type
+        self._regimes_autorises = {"range"} if strategy_type == "rsi" else {"bull", "bear"}
+        self._closes_hist: list = []
+        self._regime_counts = {"bull": 0, "bear": 0, "range": 0, "chaos": 0}
+        self._entree_autorisee = True
 
     def _prix_achat(self, close):
         return close * (1 + self.slippage)
@@ -88,6 +97,16 @@ class BacktestEngine:
             close = float(bougie["close"])
             low = float(bougie["low"])
             high = float(bougie["high"])
+
+            if self.regime_filter:
+                self._closes_hist.append(close)
+                if len(self._closes_hist) > 210:
+                    del self._closes_hist[:-210]
+                regime = detect_regime(self._closes_hist)
+                self._regime_counts[regime] += 1
+                self._entree_autorisee = regime in self._regimes_autorises
+                if i % 100 == 0:
+                    print(f"  [regime] bougie {i} (ts={ts}) -> {regime}")
 
             seuil = None
             if units > 0:
@@ -122,18 +141,20 @@ class BacktestEngine:
             signal = self.strategy.evaluate(fenetre)
 
             if signal == Signal.BUY and units <= 0:
-                notional_cible = self.risk.cap_order_size(self.max_order_size)
-                notional = min(notional_cible, cash / (1 + self.fee_rate))
-                if notional <= 0:
-                    continue
-                prix_achat = self._prix_achat(close)
-                units = notional / prix_achat
-                cout_achat = notional + notional * self.fee_rate
-                cash -= cout_achat
-                entry_price = close
-                entry_ts = ts
-                peak_price = close
-                self.risk.register_entry(entry_price)
+                bloquee = self.regime_filter and not self._entree_autorisee
+                if not bloquee:
+                    notional_cible = self.risk.cap_order_size(self.max_order_size)
+                    notional = min(notional_cible, cash / (1 + self.fee_rate))
+                    if notional <= 0:
+                        continue
+                    prix_achat = self._prix_achat(close)
+                    units = notional / prix_achat
+                    cout_achat = notional + notional * self.fee_rate
+                    cash -= cout_achat
+                    entry_price = close
+                    entry_ts = ts
+                    peak_price = close
+                    self.risk.register_entry(entry_price)
 
             elif signal == Signal.SELL and units > 0:
                 prix = self._prix_vente(close)
@@ -182,6 +203,8 @@ class BacktestEngine:
 
         duree_moyenne = sum(t["duree_min"] for t in trades) / nb_trades if nb_trades else 0.0
 
+        total_regime = sum(self._regime_counts.values())
+
         return {
             "nb_trades": nb_trades,
             "win_rate": win_rate,
@@ -194,6 +217,10 @@ class BacktestEngine:
             "rendement_total_pct": total_pnl / self.capital * 100.0 if self.capital else 0.0,
             "dernier_motif": trades[-1]["motif"] if trades else None,
             "bougies": len(donnees),
+            "regime_bull_pct": self._regime_counts["bull"] / total_regime if total_regime else 0.0,
+            "regime_bear_pct": self._regime_counts["bear"] / total_regime if total_regime else 0.0,
+            "regime_range_pct": self._regime_counts["range"] / total_regime if total_regime else 0.0,
+            "regime_chaos_pct": self._regime_counts["chaos"] / total_regime if total_regime else 0.0,
         }
 
     def resumer(self, metriques: dict):
@@ -208,6 +235,10 @@ class BacktestEngine:
         print(f"Sharpe (simplifie)          : {metriques['sharpe']:.3f}")
         print(f"Duree moyenne de position   : {metriques['duree_moyenne_min']:.0f} min")
         print(f"Bougies analysees           : {metriques['bougies']}")
+        if self.regime_filter:
+            print(f"Regimes (bougies classees)  : bull {metriques['regime_bull_pct']:.1%} "
+                  f"/ bear {metriques['regime_bear_pct']:.1%} / range {metriques['regime_range_pct']:.1%} "
+                  f"/ chaos {metriques['regime_chaos_pct']:.1%}")
 
 
 def charger_csv(chemin) -> pd.DataFrame:
@@ -234,12 +265,14 @@ def main():
     parser.add_argument("--strategy", choices=["ma", "rsi"], default="ma",
                         help="Strategie: ma (croisement de MAs, defaut) ou rsi (mean-reversion)")
     parser.add_argument("--rsi-period", type=int, default=14, help="Periode RSI (strategie rsi)")
-    parser.add_argument("--rsi-oversold", type=float, default=30.0, help="Seuil d'achat RSI (defaut 30)")
-    parser.add_argument("--rsi-exit", type=float, default=50.0, help="Seuil de sortie RSI (defaut 50)")
+    parser.add_argument("--rsi-oversold", type=float, default=25.0, help="Seuil d'achat RSI (defaut 25)")
+    parser.add_argument("--rsi-exit", type=float, default=55.0, help="Seuil de sortie RSI (defaut 55)")
     parser.add_argument("--risk-mode", choices=["fixed", "trailing"], default="fixed",
                         help="RiskManager: fixed (stop fixe, defaut) ou trailing (trailing-stop)")
     parser.add_argument("--trailing-pct", type=float, default=2.0,
                         help="Pourcentage de retrait depuis le plus haut (risk-mode trailing)")
+    parser.add_argument("--regime-filter", action="store_true",
+                        help="Filtre de regime: rsi -> entrees en range seul, ma -> en bull/bear seul")
     args = parser.parse_args()
 
     donnees = charger_csv(args.data)
@@ -259,8 +292,15 @@ def main():
               f"— frais {args.fee:.2%}, slippage {args.slippage:.2%}")
     if args.risk_mode == "trailing":
         print(f"Mode risque: trailing-stop {args.trailing_pct:.2f}% depuis le plus haut")
-    else:
+    elif args.stop_loss_pct:
         print(f"Mode risque: stop-loss fixe {args.stop_loss_pct:.2f}% entrees")
+    else:
+        print("Mode risque: aucun stop-loss (position gardee jusqu'au signal)")
+    if args.regime_filter:
+        if args.strategy == "rsi":
+            print("Filtre de regime ACTIF : entrees RSI uniquement en regime range (cash en bull/bear/chaos)")
+        else:
+            print("Filtre de regime ACTIF : entrees MA uniquement en regime bull/bear (cash en range/chaos)")
 
     engine = BacktestEngine(
         strategy=strategy,
@@ -272,6 +312,8 @@ def main():
         window_size=args.window,
         risk_mode=args.risk_mode,
         trailing_pct=args.trailing_pct,
+        regime_filter=args.regime_filter,
+        strategy_type=args.strategy,
     )
     metriques = engine.run(donnees)
     engine.resumer(metriques)
