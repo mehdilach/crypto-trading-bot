@@ -13,6 +13,7 @@ Sinon -> "SEUILS MAL CALIBRES" (il faut ajuster regime_filter.py).
 Aucun crash tolere : si une exception survient, le script affiche
 l'erreur avec la bougie fautive et sort en code 1.
 """
+import argparse
 import csv
 import datetime
 import sys
@@ -21,25 +22,31 @@ from pathlib import Path
 
 from regime_filter import detect_regime
 
-CHEMIN_CSV = Path(__file__).resolve().parent / "data" / "btc_usdt_1h.csv"
+CHEMIN_DEFAUT = Path(__file__).resolve().parent / "data" / "btc_usdt_1h.csv"
 WINDOW = 200          # periode MA du filtre
 BUFFER = WINDOW + 10  # fenetre glissante exacte de detect_regime
 
 
 def main() -> int:
-    if not CHEMIN_CSV.exists():
-        print(f"[ERREUR] CSV introuvable : {CHEMIN_CSV}")
+    parser = argparse.ArgumentParser(description="Valide la distribution des regimes sur un CSV OHLCV")
+    parser.add_argument("--data", default=str(CHEMIN_DEFAUT),
+                        help="Chemin du CSV 1h (ex: backtesting/data/sol_usdt_1h.csv)")
+    args = parser.parse_args()
+    chemin_csv = Path(args.data)
+
+    if not chemin_csv.exists():
+        print(f"[ERREUR] CSV introuvable : {chemin_csv}")
         return 1
 
     closes: list = []
     timestamps: list = []
-    with open(CHEMIN_CSV, newline="") as f:
+    with open(chemin_csv, newline="") as f:
         for ligne in csv.DictReader(f):
             closes.append(float(ligne["close"]))
             timestamps.append(int(ligne["ts"]))
 
     nb_bougies = len(closes)
-    print(f"CSV charge : {nb_bougies} bougies depuis {CHEMIN_CSV.name}")
+    print(f"CSV charge : {nb_bougies} bougies depuis {chemin_csv.name}")
     print(f"Fenetre glissante : {BUFFER} bougies (MA {WINDOW} + pente 10)\n")
 
     distribution: Counter = Counter()

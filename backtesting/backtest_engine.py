@@ -60,7 +60,7 @@ class BacktestEngine:
             self.risk = TrailingStopRiskManager(
                 max_order_size=max_order_size,
                 stop_loss_pct=stop_loss_pct,
-                trailing_pct=self.trailing_pct,
+                trailing_pct=trailing_pct,
             )
         else:
             self.risk = RiskManager(max_order_size=max_order_size, stop_loss_pct=stop_loss_pct)
@@ -251,6 +251,29 @@ def charger_csv(chemin) -> pd.DataFrame:
     return df
 
 
+WARMUP_BOUGIES = 210
+
+
+def tronquer_dates(donnees: pd.DataFrame, debut: str | None, fin: str | None) -> pd.DataFrame:
+    """Tronque un CSV OHLCV aux bornes de dates (UTC) avec warmup.
+
+    Garde-fous : intervalle vide -> ValueError ; les 210 bougies precedant
+    la borne de debut sont conservees (warmup MA(200) + filtre de regime)
+    pour que la strategie soit operante des la premiere bougie du test.
+    """
+    dts = pd.to_datetime(donnees["ts"], unit="ms", utc=True)
+    masque = pd.Series(True, index=donnees.index)
+    if debut is not None:
+        masque &= dts >= pd.Timestamp(debut, tz="UTC")
+    if fin is not None:
+        masque &= dts <= pd.Timestamp(fin, tz="UTC") + pd.Timedelta(hours=23, minutes=59)
+    idx = donnees.index[masque]
+    if len(idx) == 0:
+        raise ValueError(f"Intervalle vide entre debut={debut} et fin={fin}")
+    premiere = max(0, int(idx[0]) - WARMUP_BOUGIES)
+    return donnees.loc[premiere : idx[-1]].reset_index(drop=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backtest d'une strategie sur un CSV OHLCV")
     parser.add_argument("--data", default=str(Path(__file__).parent / "data" / "btc_usdt_5m.csv"))
@@ -273,10 +296,20 @@ def main():
                         help="Pourcentage de retrait depuis le plus haut (risk-mode trailing)")
     parser.add_argument("--regime-filter", action="store_true",
                         help="Filtre de regime: rsi -> entrees en range seul, ma -> en bull/bear seul")
+    parser.add_argument("--start-date", default=None,
+                        help="Borne de debut YYYY-MM-DD (UTC) — warmup de 210 bougies inclus automatiquement")
+    parser.add_argument("--end-date", default=None,
+                        help="Borne de fin YYYY-MM-DD (UTC), journee incluse")
     args = parser.parse_args()
 
     donnees = charger_csv(args.data)
+    if args.start_date is not None or args.end_date is not None:
+        donnees = tronquer_dates(donnees, args.start_date, args.end_date)
     print(f"Charge: {len(donnees)} bougies depuis {args.data}")
+    if args.start_date is not None or args.end_date is not None:
+        prem = pd.to_datetime(donnees.iloc[0]["ts"], unit="ms", utc=True).strftime("%Y-%m-%d %H:%M")
+        dern = pd.to_datetime(donnees.iloc[-1]["ts"], unit="ms", utc=True).strftime("%Y-%m-%d %H:%M")
+        print(f"Fenetre retenue (warmup inclus) : {prem} UTC -> {dern} UTC")
 
     if args.strategy == "rsi":
         strategy = RsiMeanReversion(

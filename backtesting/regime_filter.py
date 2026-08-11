@@ -25,11 +25,9 @@ Architecture (ordre strict) :
     candidat bull/bear ET ATR < SEUIL_ATR_RANGE  -> reclasse "range"
     cas mixtes restants                          -> "range" par defaut
 
-Seuils calibres sur BTC/USDT 1h (2 ans, backtesting/data/btc_usdt_1h.csv) :
-  ~36% bull / ~31% bear / ~28% range / ~5% chaos — voir
-  backtesting/test_regime.py. Calcul 100% natif Python (pas de
-  numpy/pandas). Programmation defensive : anti-division par zero,
-  anti-IndexError, types annotes, logs de debug sur chaque decision.
+Seuils calibres sur SOL/USDT 1h (2 ans, backtesting/data/sol_usdt_1h.csv) :
+  ~33% bull / ~31% bear / ~29% range / ~7% chaos — voir
+  backtesting/test_regime.py (--data pour changer d'actif).
 
 Testable isolement : python backtesting/regime_filter.py
 """
@@ -40,10 +38,10 @@ from typing import List
 logger = logging.getLogger("crypto-bot.regime")
 
 N_PENTE = 10
-SEUIL_SLOPE = 0.0009
-SEUIL_ATR_CHAOS = 0.0065
-SEUIL_ATR_TREND = 0.0010
-SEUIL_ATR_RANGE = 0.0008
+SEUIL_SLOPE = 0.0010
+SEUIL_ATR_CHAOS = 0.0100
+SEUIL_ATR_TREND = 0.0030
+SEUIL_ATR_RANGE = 0.0025
 PERIODE_ATR = 14
 
 
