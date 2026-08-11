@@ -26,11 +26,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from risk_manager import RiskManager
 from regime_filter import detect_regime
 from strategies.base import Signal
+from strategies.grid_trading import GridStrategy
 from strategies.moving_average_crossover import MovingAverageCrossover
 from strategies.rsi_mean_reversion import RsiMeanReversion
 from trailing_risk_manager import TrailingStopRiskManager
 
 COLONNES = ["ts", "open", "high", "low", "close", "volume"]
+
+WINDOW_BORNES_GRID = 2160  # fenetre glissante des bornes de la grille (90j)
+RECALC_BORNES_GRID = 720   # recalcul des bornes tous les 30 jours
 
 
 class BacktestEngine:
@@ -66,7 +70,7 @@ class BacktestEngine:
             self.risk = RiskManager(max_order_size=max_order_size, stop_loss_pct=stop_loss_pct)
         self.regime_filter = regime_filter
         self.strategy_type = strategy_type
-        self._regimes_autorises = {"range"} if strategy_type == "rsi" else {"bull", "bear"}
+        self._regimes_autorises = {"range"} if strategy_type == "grid" or strategy_type == "rsi" else {"bull", "bear"}
         self._closes_hist: list = []
         self._regime_counts = {"bull": 0, "bear": 0, "range": 0, "chaos": 0}
         self._entree_autorisee = True
@@ -80,6 +84,8 @@ class BacktestEngine:
     def run(self, donnees: pd.DataFrame) -> dict:
         if list(donnees.columns) != COLONNES:
             raise ValueError(f"Colonnes attendues: {COLONNES}, recu: {list(donnees.columns)}")
+        if self.strategy_type == "grid":
+            return self._run_grid(donnees)
         self.capital = float(self.capital)
         cash = self.capital
         units = 0.0
@@ -105,8 +111,6 @@ class BacktestEngine:
                 regime = detect_regime(self._closes_hist)
                 self._regime_counts[regime] += 1
                 self._entree_autorisee = regime in self._regimes_autorises
-                if i % 100 == 0:
-                    print(f"  [regime] bougie {i} (ts={ts}) -> {regime}")
 
             seuil = None
             if units > 0:
@@ -175,6 +179,87 @@ class BacktestEngine:
 
             equity = cash + units * close
             equity_curve.append(equity)
+
+        return self._metriques(donnees, trades, equity_curve)
+
+    def _run_grid(self, donnees: pd.DataFrame) -> dict:
+        """Mecanique de grille dediee (multi-niveaux, hors contrat Strategy).
+
+        En regime "range" : achats sur niveaux touches (capital partage entre
+        les cellules), vente au niveau superieur (+1 pas = take-profit).
+        Hors range : liquidation des positions ouvertes au prix courant,
+        aucune nouvelle entree. Bornes glissantes recalees periodiquement.
+        """
+        cash = float(self.capital)
+        trades = []
+        equity_curve = []
+        slots = {}
+        niveaux: list = []
+
+        for i in range(len(donnees)):
+            bougie = donnees.iloc[i]
+            ts = int(bougie["ts"])
+            close = float(bougie["close"])
+            low = float(bougie["low"])
+            high = float(bougie["high"])
+
+            if i < self.window_size:
+                equity_curve.append(cash)
+                continue
+
+            self._closes_hist.append(close)
+            if len(self._closes_hist) > 210:
+                del self._closes_hist[:-210]
+            regime = detect_regime(self._closes_hist)
+            self._regime_counts[regime] += 1
+
+            if len(niveaux) == 0 or i % RECALC_BORNES_GRID == 0:
+                debut = max(0, i - WINDOW_BORNES_GRID)
+                fenetre = donnees.iloc[debut : i + 1]
+                support = 0.85 * float(fenetre["low"].min())
+                resistance = 1.15 * float(fenetre["high"].max())
+                niveaux = self.strategy.construire_niveaux(support, resistance)
+
+            grille_active = regime == "range" and len(niveaux) > 1
+
+            if not grille_active:
+                equity_curve.append(
+                    cash + sum(s["units"] * close for s in slots.values())
+                )
+                continue
+
+            for k, prix_n in enumerate(niveaux[:-1]):
+                if prix_n in slots and high >= niveaux[k + 1]:
+                    slot = slots.pop(prix_n)
+                    prix_v = niveaux[k + 1] * (1 - self.slippage)
+                    produit = slot["units"] * prix_v
+                    frais = produit * self.fee_rate
+                    cash += produit - frais
+                    pnl = (produit - frais) - slot["cout"]
+                    trades.append({
+                        "pnl": pnl,
+                        "rendement": pnl / slot["cout"] if slot["cout"] else 0.0,
+                        "duree_min": (ts - slot["ts_entree"]) / 60000.0,
+                        "motif": "take-profit",
+                    })
+
+            notional_par_cellule = self.max_order_size / max(len(niveaux), 1)
+            for prix_n in niveaux:
+                if prix_n in slots or low > prix_n:
+                    continue
+                notional = min(notional_par_cellule, cash / (1 + self.fee_rate))
+                if notional <= 0:
+                    continue
+                prix_a = prix_n * (1 + self.slippage)
+                if prix_a <= 0:
+                    continue
+                units = notional / prix_a
+                cout = notional + notional * self.fee_rate
+                cash -= cout
+                slots[prix_n] = {"units": units, "ts_entree": ts, "cout": cout}
+
+            valeur = cash + sum(s["units"] * close for s in slots.values())
+            equity_curve.append(valeur)
 
         return self._metriques(donnees, trades, equity_curve)
 
@@ -285,8 +370,10 @@ def main():
     parser.add_argument("--window", type=int, default=100)
     parser.add_argument("--fast", type=int, default=3, help="Periode MA rapide")
     parser.add_argument("--slow", type=int, default=7, help="Periode MA lente")
-    parser.add_argument("--strategy", choices=["ma", "rsi"], default="ma",
-                        help="Strategie: ma (croisement de MAs, defaut) ou rsi (mean-reversion)")
+    parser.add_argument("--strategy", choices=["ma", "rsi", "grid"], default="ma",
+                        help="Strategie: ma (croisement de MAs, defaut), rsi (mean-reversion) ou grid (grille range)")
+    parser.add_argument("--grid-step", type=float, default=1.2,
+                        help="Pas de la grille en pourcentage (strategie grid, defaut 1.2)")
     parser.add_argument("--rsi-period", type=int, default=14, help="Periode RSI (strategie rsi)")
     parser.add_argument("--rsi-oversold", type=float, default=25.0, help="Seuil d'achat RSI (defaut 25)")
     parser.add_argument("--rsi-exit", type=float, default=55.0, help="Seuil de sortie RSI (defaut 55)")
@@ -319,6 +406,10 @@ def main():
         )
         print(f"Strategie RSI({args.rsi_period}) oversold < {args.rsi_oversold:g}, sortie > {args.rsi_exit:g} "
               f"— frais {args.fee:.2%}, slippage {args.slippage:.2%}")
+    elif args.strategy == "grid":
+        strategy = GridStrategy(pas_pct=args.grid_step)
+        print(f"Strategie GRID (pas {args.grid_step:g}%, TP +1 pas, bornes glissantes 90j "
+              f"— frais {args.fee:.2%}, slippage {args.slippage:.2%})")
     else:
         strategy = MovingAverageCrossover(fast_period=args.fast, slow_period=args.slow)
         print(f"Strategie MA({args.fast})/MA({args.slow}) "
@@ -332,6 +423,8 @@ def main():
     if args.regime_filter:
         if args.strategy == "rsi":
             print("Filtre de regime ACTIF : entrees RSI uniquement en regime range (cash en bull/bear/chaos)")
+        elif args.strategy == "grid":
+            print("Filtre de regime ACTIF : grille active uniquement en regime range (vendu sinon)")
         else:
             print("Filtre de regime ACTIF : entrees MA uniquement en regime bull/bear (cash en range/chaos)")
 
