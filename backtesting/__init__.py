@@ -1,0 +1,1 @@
+"""Package backtesting : moteur, filtre de regime et validation."""

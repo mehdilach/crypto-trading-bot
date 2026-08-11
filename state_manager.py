@@ -21,6 +21,7 @@ from pathlib import Path
 logger = logging.getLogger("crypto-bot.state")
 
 STATE_FILE = Path(__file__).parent / "state.json"
+GRID_SLOTS_FILE = Path(__file__).parent / "grid_slots.json"
 DEFAUT = {"in_position": False, "entry_price": None, "symbol": None}
 
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
@@ -36,6 +37,23 @@ CREATE TABLE IF NOT EXISTS bot_state (
     updated_at TEXT NOT NULL
 )
 """
+_SCHEMA_SLOTS_SQL = """
+CREATE TABLE IF NOT EXISTS grid_slots (
+    id TEXT PRIMARY KEY,
+    slots_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+_UPSERT_SLOTS_SQL = """
+INSERT INTO grid_slots (id, slots_json, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    slots_json = excluded.slots_json,
+    updated_at = excluded.updated_at
+"""
+_SELECT_SLOTS_SQL = (
+    "SELECT slots_json, updated_at FROM grid_slots WHERE id = ?"
+)
 _UPSERT_SQL = """
 INSERT INTO bot_state (id, in_position, entry_price, symbol, updated_at)
 VALUES (?, ?, ?, ?, ?)
@@ -91,6 +109,22 @@ class StateManager:
         else:
             self._save_fichier(etat)
 
+    def save_slots(self, slots_list):
+        """Persiste les cellules de la grille (liste serialisable JSON)."""
+        donnees = {
+            "slots": list(slots_list),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if MODE_TURSO:
+            self._save_slots_turso(donnees)
+        else:
+            self._ecrire_json_atomique(GRID_SLOTS_FILE, donnees)
+
+    def load_slots(self):
+        if MODE_TURSO:
+            return self._load_slots_turso()
+        return self._load_slots_fichier()
+
     def load_state(self):
         if MODE_TURSO:
             return self._load_turso()
@@ -103,6 +137,7 @@ class StateManager:
             from turso_serverless import connect as turso_connect
             conn = turso_connect(TURSO_URL, auth_token=TURSO_TOKEN or None)
             conn.execute(_SCHEMA_SQL)
+            conn.execute(_SCHEMA_SLOTS_SQL)
             conn.commit()
             self._conn = conn
             return True
@@ -174,8 +209,8 @@ class StateManager:
                     )
             return dict(DEFAUT)
 
-    def _save_fichier(self, etat):
-        dossier = self.chemin.parent
+    def _ecrire_json_atomique(self, chemin, donnees):
+        dossier = Path(chemin).parent
         tmp = None
         try:
             if not dossier.exists():
@@ -188,11 +223,11 @@ class StateManager:
                 suffix=".tmp",
                 delete=False,
             )
-            json.dump(etat, tmp, ensure_ascii=False, indent=2)
+            json.dump(donnees, tmp, ensure_ascii=False, indent=2)
             tmp.flush()
             os.fsync(tmp.fileno())
             tmp.close()
-            os.replace(tmp.name, self.chemin)
+            os.replace(tmp.name, chemin)
         except Exception as e:
             if tmp is not None and not tmp.closed:
                 tmp.close()
@@ -201,7 +236,86 @@ class StateManager:
                     os.unlink(tmp.name)
             except OSError:
                 pass
-            logger.warning("Echec d'ecriture de state.json: %s: %s", type(e).__name__, e)
+            logger.warning("Echec d'ecriture de %s: %s: %s", Path(chemin).name, type(e).__name__, e)
+
+    def _save_fichier(self, etat):
+        self._ecrire_json_atomique(self.chemin, etat)
+
+    def _save_slots_turso(self, donnees):
+        if not self._connecter_turso():
+            logger.error("Slots NON sauvegardes (Turso indisponible)")
+            return
+        params = (_LIGNE_CURRENT, json.dumps(donnees["slots"], ensure_ascii=False), donnees["updated_at"])
+        try:
+            self._conn.execute(_UPSERT_SLOTS_SQL, params)
+            self._conn.commit()
+        except Exception as e:
+            self._conn = None
+            logger.warning("Ecriture slots Turso echouee (%s: %s) — reconnexion.", type(e).__name__, e)
+            if self._connecter_turso():
+                try:
+                    self._conn.execute(_UPSERT_SLOTS_SQL, params)
+                    self._conn.commit()
+                except Exception as e2:
+                    self._conn = None
+                    logger.error(
+                        "Ecriture slots Turso echouee apres reconnexion (%s: %s) — non persiste.",
+                        type(e2).__name__, e2,
+                    )
+
+    def _extraire_slots_json(self, ligne):
+        if ligne is None:
+            return []
+        if isinstance(ligne, dict):
+            slots_json = ligne.get("slots_json")
+        else:
+            slots_json = ligne[0]
+        try:
+            slots = json.loads(slots_json)
+        except (TypeError, ValueError):
+            return []
+        return slots if isinstance(slots, list) else []
+
+    def _load_slots_turso(self):
+        if not self._connecter_turso():
+            return []
+        try:
+            return self._extraire_slots_json(
+                self._conn.execute(_SELECT_SLOTS_SQL, (_LIGNE_CURRENT,)).fetchone()
+            )
+        except Exception as e:
+            self._conn = None
+            logger.warning(
+                "Lecture slots Turso echouee (%s: %s) — tentative de reconnexion.",
+                type(e).__name__, e,
+            )
+            if self._connecter_turso():
+                try:
+                    return self._extraire_slots_json(
+                        self._conn.execute(_SELECT_SLOTS_SQL, (_LIGNE_CURRENT,)).fetchone()
+                    )
+                except Exception as e2:
+                    self._conn = None
+                    logger.warning(
+                        "Lecture slots Turso echouee apres reconnexion (%s: %s) — grille vide.",
+                        type(e2).__name__, e2,
+                    )
+            return []
+
+    def _load_slots_fichier(self):
+        if not GRID_SLOTS_FILE.exists():
+            return []
+        try:
+            with GRID_SLOTS_FILE.open(encoding="utf-8") as f:
+                data = json.load(f)
+            slots = data.get("slots", [])
+            return slots if isinstance(slots, list) else []
+        except Exception as e:
+            logger.warning(
+                "grid_slots.json illisible (%s: %s) — grille vide (aucun slot restaure).",
+                type(e).__name__, e,
+            )
+            return []
 
     def _load_fichier(self):
         if not self.chemin.exists():
