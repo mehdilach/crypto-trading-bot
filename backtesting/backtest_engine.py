@@ -21,10 +21,13 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from risk_manager import RiskManager
 from strategies.base import Signal
 from strategies.moving_average_crossover import MovingAverageCrossover
+from strategies.rsi_mean_reversion import RsiMeanReversion
+from trailing_risk_manager import TrailingStopRiskManager
 
 COLONNES = ["ts", "open", "high", "low", "close", "volume"]
 
@@ -39,6 +42,8 @@ class BacktestEngine:
         slippage=0.0005,
         stop_loss_pct=None,
         window_size=100,
+        risk_mode="fixed",
+        trailing_pct=2.0,
     ):
         self.strategy = strategy
         self.capital = initial_capital
@@ -46,7 +51,16 @@ class BacktestEngine:
         self.fee_rate = fee_rate
         self.slippage = slippage
         self.window_size = window_size
-        self.risk = RiskManager(max_order_size=max_order_size, stop_loss_pct=stop_loss_pct)
+        self.risk_mode = risk_mode
+        self.trailing_pct = float(trailing_pct)
+        if risk_mode == "trailing":
+            self.risk = TrailingStopRiskManager(
+                max_order_size=max_order_size,
+                stop_loss_pct=stop_loss_pct,
+                trailing_pct=self.trailing_pct,
+            )
+        else:
+            self.risk = RiskManager(max_order_size=max_order_size, stop_loss_pct=stop_loss_pct)
 
     def _prix_achat(self, close):
         return close * (1 + self.slippage)
@@ -66,16 +80,25 @@ class BacktestEngine:
 
         trades = []
         equity_curve = []
-        seuil_sl = self.risk.stop_loss_pct / 100.0 if self.risk.stop_loss_pct > 0 else None
+        peak_price = None
 
         for i in range(len(donnees)):
             bougie = donnees.iloc[i]
             ts = int(bougie["ts"])
             close = float(bougie["close"])
             low = float(bougie["low"])
+            high = float(bougie["high"])
 
-            if units > 0 and seuil_sl and low <= entry_price * (1 - seuil_sl):
-                prix = entry_price * (1 - seuil_sl)
+            seuil = None
+            if units > 0:
+                if self.risk_mode == "trailing":
+                    peak_price = max(peak_price, high)
+                    seuil = peak_price * (1 - self.trailing_pct / 100.0)
+                elif entry_price is not None and self.risk.stop_loss_pct > 0:
+                    seuil = entry_price * (1 - self.risk.stop_loss_pct / 100.0)
+
+            if seuil is not None and low <= seuil:
+                prix = seuil
                 produit = units * prix
                 frais = produit * self.fee_rate
                 cash += produit - frais
@@ -89,6 +112,7 @@ class BacktestEngine:
                 units = 0.0
                 self.risk.clear_position()
                 entry_price = None
+                peak_price = None
                 continue
 
             if i < self.window_size - 1:
@@ -108,6 +132,7 @@ class BacktestEngine:
                 cash -= cout_achat
                 entry_price = close
                 entry_ts = ts
+                peak_price = close
                 self.risk.register_entry(entry_price)
 
             elif signal == Signal.SELL and units > 0:
@@ -125,6 +150,7 @@ class BacktestEngine:
                 units = 0.0
                 self.risk.clear_position()
                 entry_price = None
+                peak_price = None
 
             equity = cash + units * close
             equity_curve.append(equity)
@@ -205,20 +231,47 @@ def main():
     parser.add_argument("--window", type=int, default=100)
     parser.add_argument("--fast", type=int, default=3, help="Periode MA rapide")
     parser.add_argument("--slow", type=int, default=7, help="Periode MA lente")
+    parser.add_argument("--strategy", choices=["ma", "rsi"], default="ma",
+                        help="Strategie: ma (croisement de MAs, defaut) ou rsi (mean-reversion)")
+    parser.add_argument("--rsi-period", type=int, default=14, help="Periode RSI (strategie rsi)")
+    parser.add_argument("--rsi-oversold", type=float, default=30.0, help="Seuil d'achat RSI (defaut 30)")
+    parser.add_argument("--rsi-exit", type=float, default=50.0, help="Seuil de sortie RSI (defaut 50)")
+    parser.add_argument("--risk-mode", choices=["fixed", "trailing"], default="fixed",
+                        help="RiskManager: fixed (stop fixe, defaut) ou trailing (trailing-stop)")
+    parser.add_argument("--trailing-pct", type=float, default=2.0,
+                        help="Pourcentage de retrait depuis le plus haut (risk-mode trailing)")
     args = parser.parse_args()
 
     donnees = charger_csv(args.data)
     print(f"Charge: {len(donnees)} bougies depuis {args.data}")
-    print(f"Strategie MA({args.fast})/MA({args.slow}) — frais {args.fee:.2%}, slippage {args.slippage:.2%}")
+
+    if args.strategy == "rsi":
+        strategy = RsiMeanReversion(
+            period=args.rsi_period,
+            oversold=args.rsi_oversold,
+            exit_level=args.rsi_exit,
+        )
+        print(f"Strategie RSI({args.rsi_period}) oversold < {args.rsi_oversold:g}, sortie > {args.rsi_exit:g} "
+              f"— frais {args.fee:.2%}, slippage {args.slippage:.2%}")
+    else:
+        strategy = MovingAverageCrossover(fast_period=args.fast, slow_period=args.slow)
+        print(f"Strategie MA({args.fast})/MA({args.slow}) "
+              f"— frais {args.fee:.2%}, slippage {args.slippage:.2%}")
+    if args.risk_mode == "trailing":
+        print(f"Mode risque: trailing-stop {args.trailing_pct:.2f}% depuis le plus haut")
+    else:
+        print(f"Mode risque: stop-loss fixe {args.stop_loss_pct:.2f}% entrees")
 
     engine = BacktestEngine(
-        strategy=MovingAverageCrossover(fast_period=args.fast, slow_period=args.slow),
+        strategy=strategy,
         initial_capital=args.capital,
         max_order_size=args.entry_size,
         fee_rate=args.fee,
         slippage=args.slippage,
         stop_loss_pct=args.stop_loss_pct,
         window_size=args.window,
+        risk_mode=args.risk_mode,
+        trailing_pct=args.trailing_pct,
     )
     metriques = engine.run(donnees)
     engine.resumer(metriques)
